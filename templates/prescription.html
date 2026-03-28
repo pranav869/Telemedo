@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prescription Generator - Tele-Health AI</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .prescription-container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            margin: 30px auto;
+            max-width: 800px;
+            padding: 40px;
+        }
+        .header-title {
+            color: #2c3e50;
+            font-weight: 700;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        .form-label {
+            font-weight: 600;
+            color: #34495e;
+            margin-bottom: 8px;
+        }
+        .form-control, .form-select {
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 12px;
+            transition: all 0.3s ease;
+        }
+        .form-control:focus, .form-select:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 8px;
+            padding: 12px 30px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .medicine-entry {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 1px solid #e9ecef;
+        }
+        .medicine-entry h6 {
+            color: #495057;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        .btn-add-medicine {
+            background: #28a745;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 20px;
+            color: white;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        .btn-add-medicine:hover {
+            background: #218838;
+            transform: translateY(-1px);
+        }
+        .btn-remove-medicine {
+            background: #dc3545;
+            border: none;
+            border-radius: 6px;
+            padding: 5px 15px;
+            color: white;
+            font-size: 0.875rem;
+            transition: all 0.3s ease;
+        }
+        .btn-remove-medicine:hover {
+            background: #c82333;
+        }
+        .back-btn {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            color: #667eea;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+        }
+        .back-btn:hover {
+            background: white;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            color: #667eea;
+        }
+    </style>
+</head>
+<body>
+    <a href="/" class="back-btn">← Back to Home</a>
+    
+    <div class="container">
+        <div class="prescription-container">
+            <h2 class="header-title">
+                <i class="fas fa-file-medical"></i> 
+                Digital Prescription Generator
+            </h2>
+            
+            <form id="prescriptionForm">
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <label for="patientName" class="form-label">Patient Name *</label>
+                        <input type="text" class="form-control" id="patientName" name="patientName" required>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="doctorName" class="form-label">Doctor Name *</label>
+                        <input type="text" class="form-control" id="doctorName" name="doctorName" required>
+                    </div>
+                </div>
+                
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <label for="prescriptionDate" class="form-label">Date *</label>
+                        <input type="date" class="form-control" id="prescriptionDate" name="prescriptionDate" required>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="patientAge" class="form-label">Patient Age</label>
+                        <input type="number" class="form-control" id="patientAge" name="patientAge" min="0" max="150">
+                    </div>
+                </div>
+                
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <label for="patientGender" class="form-label">Gender</label>
+                        <select class="form-select" id="patientGender" name="patientGender">
+                            <option value="">Select Gender</option>
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="patientContact" class="form-label">Contact Number</label>
+                        <input type="tel" class="form-control" id="patientContact" name="patientContact">
+                    </div>
+                </div>
+                
+                <div class="mb-4">
+                    <label class="form-label">Medicines</label>
+                    <div id="medicinesContainer">
+                        <div class="medicine-entry">
+                            <h6>Medicine 1</h6>
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <input type="text" class="form-control mb-2" placeholder="Medicine Name" name="medicineName[]">
+                                </div>
+                                <div class="col-md-3">
+                                    <input type="text" class="form-control mb-2" placeholder="Dosage" name="medicineDosage[]">
+                                </div>
+                                <div class="col-md-3">
+                                    <input type="text" class="form-control mb-2" placeholder="Frequency" name="medicineFrequency[]">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-add-medicine" onclick="addMedicine()">
+                        <i class="fas fa-plus"></i> Add Medicine
+                    </button>
+                </div>
+                
+                <div class="mb-4">
+                    <label for="notes" class="form-label">Additional Notes / Instructions</label>
+                    <textarea class="form-control" id="notes" name="notes" rows="4" placeholder="Enter any additional instructions, precautions, or notes..."></textarea>
+                </div>
+                
+                <div class="mb-4">
+                    <label for="diagnosis" class="form-label">Diagnosis</label>
+                    <input type="text" class="form-control" id="diagnosis" name="diagnosis" placeholder="Enter diagnosis if applicable...">
+                </div>
+                
+                <div class="text-center">
+                    <button type="submit" class="btn btn-primary btn-lg">
+                        <i class="fas fa-file-pdf"></i> Generate Prescription PDF
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://kit.fontawesome.com/your-fontawesome-key.js" crossorigin="anonymous"></script>
+    <script>
+        // Set today's date as default
+        document.getElementById('prescriptionDate').valueAsDate = new Date();
+        
+        let medicineCount = 1;
+        
+        function addMedicine() {
+            medicineCount++;
+            const medicineEntry = document.createElement('div');
+            medicineEntry.className = 'medicine-entry';
+            medicineEntry.innerHTML = `
+                <h6>Medicine ${medicineCount} <button type="button" class="btn-remove-medicine float-end" onclick="removeMedicine(this)">Remove</button></h6>
+                <div class="row">
+                    <div class="col-md-6">
+                        <input type="text" class="form-control mb-2" placeholder="Medicine Name" name="medicineName[]">
+                    </div>
+                    <div class="col-md-3">
+                        <input type="text" class="form-control mb-2" placeholder="Dosage" name="medicineDosage[]">
+                    </div>
+                    <div class="col-md-3">
+                        <input type="text" class="form-control mb-2" placeholder="Frequency" name="medicineFrequency[]">
+                    </div>
+                </div>
+            `;
+            document.getElementById('medicinesContainer').appendChild(medicineEntry);
+        }
+        
+        function removeMedicine(button) {
+            button.closest('.medicine-entry').remove();
+        }
+        
+        document.getElementById('prescriptionForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const data = {};
+            
+            // Collect form data
+            for (let [key, value] of formData.entries()) {
+                if (key.endsWith('[]')) {
+                    const baseKey = key.slice(0, -2);
+                    if (!data[baseKey]) data[baseKey] = [];
+                    data[baseKey].push(value);
+                } else {
+                    data[key] = value;
+                }
+            }
+            
+            try {
+                const response = await fetch('/generate_prescription', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                });
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = `prescription_${data.patientName}_${data.prescriptionDate}.pdf`;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                    
+                    alert('Prescription PDF generated successfully!');
+                } else {
+                    alert('Error generating prescription. Please try again.');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error generating prescription. Please try again.');
+            }
+        });
+    </script>
+</body>
+</html>

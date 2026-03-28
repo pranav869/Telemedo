@@ -1,0 +1,48 @@
+# ── Secrets ────────────────────────────────────────────────
+.env
+*.env
+.env.*
+
+# ── Datasets & large data files ────────────────────────────
+assets/
+glossary_expanded.csv
+Indian-Sign-Language-Recognition-master/
+Unvoiced-master/
+*.csv
+
+# ── ML model weights ───────────────────────────────────────
+*.h5
+*.pb
+*.tflite
+*.pt
+*.pth
+chest_cancer_classifier.h5
+sign_to_text_cnn.h5
+trained_model_graph.pb
+
+# ── Virtual environments ───────────────────────────────────
+venv/
+.venv/
+.venv311/
+isl-env/
+env/
+
+# ── Python cache ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Runtime generated ──────────────────────────────────────
+uploads/
+output/
+static/uploads/
+static/output/
+
+# ── OS ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp

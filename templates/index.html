@@ -1,0 +1,2342 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>Tele-Health AI</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@latest/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
+
+    <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.18.2.js"></script>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+    <!-- MediaPipe Tasks Vision (Face/Gesture Landmarkers) -->
+    <script type="module">
+    // Real-time Unvoiced-master ASL Alphabet Recognition (Patient Side)
+    let unvoicedMonitor = {
+      running: false,
+      lastSentLetter: "",
+      lastSentAtMs: 0,
+      minSendGapMs: 1500,
+    };
+
+    async function startUnvoicedRecognitionMonitor() {
+      if (myRole !== "patient" || unvoicedMonitor.running) return;
+      unvoicedMonitor.running = true;
+
+      const videoEl = _getAnalysisStreamVideoEl();
+      if (!videoEl) {
+        unvoicedMonitor.running = false;
+        return;
+      }
+      await videoEl.play().catch(() => {});
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = 400; // ROI is 280x280, but model expects 200x200 after crop
+      canvas.height = 400;
+
+      const loop = async () => {
+        if (!isCallActive || myRole !== "patient" || !unvoicedMonitor.running) {
+          unvoicedMonitor.running = false;
+          return;
+        }
+
+        const nowMs = Date.now();
+        if (nowMs - unvoicedMonitor.lastSentAtMs >= unvoicedMonitor.minSendGapMs) {
+          try {
+            // Draw current video frame to canvas
+            ctx.drawImage(videoEl, 0, 0, 400, 400);
+            // Crop ROI (as in live_demo.py: [70:350, 70:350])
+            const roiCanvas = document.createElement('canvas');
+            roiCanvas.width = 280;
+            roiCanvas.height = 280;
+            const roiCtx = roiCanvas.getContext('2d');
+            roiCtx.drawImage(canvas, 70, 70, 280, 280, 0, 0, 280, 280);
+            // Resize to 200x200 for model
+            const finalCanvas = document.createElement('canvas');
+            finalCanvas.width = 200;
+            finalCanvas.height = 200;
+            const finalCtx = finalCanvas.getContext('2d');
+            finalCtx.drawImage(roiCanvas, 0, 0, 200, 200);
+            const blob = await new Promise((resolve) => finalCanvas.toBlob(resolve, 'image/jpeg', 0.95));
+            const formData = new FormData();
+            formData.append('frame', blob, 'frame.jpg');
+
+            const res = await fetch('/predict_unvoiced', {
+              method: 'POST',
+              body: formData,
+            });
+            const data = await res.json();
+            const letter = (data && data.letter) || "unknown";
+            const conf = Math.round(((data && data.confidence) || 0) * 100);
+
+            if (letter && letter !== "unknown" && letter !== unvoicedMonitor.lastSentLetter) {
+              unvoicedMonitor.lastSentLetter = letter;
+              unvoicedMonitor.lastSentAtMs = nowMs;
+              socket.emit("send_patient_sign_text", {
+                room: currentRoom,
+                word: letter,
+                confidence: conf,
+                gesture: "unvoiced_asl",
+                ts: nowMs,
+              });
+              addBubble(`ASL Letter recognized: ${letter.toUpperCase()} (${conf}%)`, "NORMAL", "me");
+            }
+          } catch (e) {
+            // Ignore errors
+          }
+        }
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
+
+    // Start Unvoiced recognition when patient joins a call
+    socket.on("join_response", (data) => {
+      if (data.allowed && myRole === "patient") {
+        setTimeout(() => {
+          startUnvoicedRecognitionMonitor();
+        }, 1800); // Wait for video to be ready
+      }
+    });
+      // Kept in a small module so we can lazy-init later.
+      window.__MP_TASKS = {
+        FilesetResolver: null,
+        FaceLandmarker: null,
+        GestureRecognizer: null,
+        ready: false,
+        async load() {
+          if (this.ready) return;
+          const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
+          this.FilesetResolver = vision.FilesetResolver;
+          this.FaceLandmarker = vision.FaceLandmarker;
+          this.GestureRecognizer = vision.GestureRecognizer;
+          this.ready = true;
+        },
+      };
+    </script>
+    <!-- Real-Time MediaPipe Gesture Recognition (Patient Side) -->
+    <script type="module">
+    // Only run for patient role
+    let gestureRecognizerInstance = null;
+    let gestureRecognitionRunning = false;
+    let lastGestureSent = "";
+    let lastGestureSentAt = 0;
+    const minGestureSendGapMs = 1200;
+
+    async function startGestureRecognitionMonitor() {
+      if (myRole !== "patient" || gestureRecognitionRunning) return;
+      gestureRecognitionRunning = true;
+      await window.__MP_TASKS.load();
+      const { FilesetResolver, GestureRecognizer } = window.__MP_TASKS;
+      const fileset = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      gestureRecognizerInstance = await GestureRecognizer.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+        },
+        runningMode: "VIDEO",
+      });
+
+      // Use the same video source as emotion/sign monitor
+      const videoEl = _getAnalysisStreamVideoEl();
+      if (!videoEl) {
+        gestureRecognitionRunning = false;
+        return;
+      }
+      await videoEl.play().catch(() => {});
+
+      const loop = async () => {
+        if (!gestureRecognitionRunning || !isCallActive || myRole !== "patient") {
+          gestureRecognitionRunning = false;
+          return;
+        }
+        try {
+          const now = performance.now();
+          const result = gestureRecognizerInstance.recognizeForVideo(videoEl, now);
+          if (result && result.gestures && result.gestures.length > 0) {
+            const gesture = result.gestures[0][0];
+            const label = gesture.categoryName;
+            const confidence = gesture.score;
+            const nowMs = Date.now();
+            if (
+              label &&
+              confidence >= 0.7 &&
+              (label !== lastGestureSent || nowMs - lastGestureSentAt > minGestureSendGapMs)
+            ) {
+              lastGestureSent = label;
+              lastGestureSentAt = nowMs;
+              // Send to backend for mapping and broadcast
+              fetch("/predict_sign", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ gesture: label, confidence }),
+              })
+                .then((res) => res.json())
+                .then((data) => {
+                  if (data && data.word && data.word !== "unknown") {
+                    socket.emit("send_patient_sign_text", {
+                      room: currentRoom,
+                      word: data.word,
+                      confidence: data.confidence,
+                      gesture: label,
+                      ts: nowMs,
+                    });
+                    addBubble(`Gesture: ${data.word} (${Math.round(confidence * 100)}%)`, "NORMAL", "me");
+                  }
+                })
+                .catch(() => {});
+            }
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+        requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    }
+
+    // Start gesture recognition when patient joins a call
+    socket.on("join_response", (data) => {
+      if (data.allowed && myRole === "patient") {
+        setTimeout(() => {
+          startGestureRecognitionMonitor();
+        }, 1200); // Wait for video to be ready
+      }
+    });
+    </script>
+
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+      rel="stylesheet"
+    />
+
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background-color: #f0f2f5;
+        font-family: "Segoe UI", sans-serif;
+      }
+
+      /* --- STATUS INDICATORS --- */
+      .status-indicator {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 5px;
+        transition: background-color 0.3s ease;
+      }
+      .dot-green {
+        background-color: #28a745;
+        box-shadow: 0 0 5px #28a745;
+      }
+      .dot-red {
+        background-color: #dc3545;
+        box-shadow: 0 0 5px #dc3545;
+      }
+      .dot-grey {
+        background-color: #adb5bd;
+        opacity: 0.5;
+      }
+
+      /* --- LANDING PAGE --- */
+      #landing-page {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(135deg, #0d6efd 0%, #0043a8 100%);
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .setup-card {
+        background: white;
+        padding: 2rem;
+        border-radius: 20px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        width: 90%;
+        max-width: 450px;
+        position: relative;
+      }
+      .role-btn {
+        width: 100%;
+        padding: 15px;
+        border: 2px solid #eee;
+        border-radius: 12px;
+        background: white;
+        transition: all 0.2s;
+        text-align: left;
+        display: flex;
+        align-items: center;
+      }
+      .role-btn:hover {
+        border-color: #0d6efd;
+        background: #f8fbff;
+      }
+      .role-btn.active {
+        border-color: #0d6efd;
+        background: #e7f1ff;
+        box-shadow: 0 0 0 4px rgba(13, 110, 253, 0.1);
+      }
+      .role-icon {
+        font-size: 24px;
+        margin-right: 15px;
+        width: 40px;
+        text-align: center;
+      }
+
+      #alert-area {
+        position: absolute;
+        top: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 80%;
+        text-align: center;
+        display: none;
+        z-index: 10000;
+      }
+
+      /* --- MAIN LAYOUT --- */
+      .main-container {
+        display: flex;
+        flex-direction: row;
+        height: 100vh;
+      }
+
+      /* --- DOCTOR TOOLS SIDEBAR --- */
+      #doctor-tools {
+        flex: 0 0 300px;
+        background: #ffffff;
+        border-right: 1px solid #dee2e6;
+        display: none; /* Hidden by default */
+        flex-direction: column;
+        overflow-y: auto;
+        padding: 15px;
+      }
+
+      .tool-card {
+        background: #f8f9fa;
+        border: 1px solid #e9ecef;
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 15px;
+      }
+
+      /* --- VIDEO AREA (AGORA) --- */
+      #video-section {
+        flex: 1;
+        background: #000;
+        position: relative;
+        overflow: hidden;
+      }
+      #remote-player-container {
+        width: 100%;
+        height: 100%;
+      }
+      .video-player {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      /* --- SIGN LANGUAGE TRANSLATOR --- */
+      #sign-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 25;
+        background: rgba(0, 0, 0, 0.92);
+        display: none; /* toggled by JS */
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      #sign-overlay.show {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #closeSignOverlayBtn {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        z-index: 30;
+      }
+      .sign-video-wrap {
+        width: min(1100px, 100%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+      #sign-video {
+        width: 100%;
+        background: #000;
+        border: 2px solid #0d6efd;
+        border-radius: 12px;
+        object-fit: contain;
+        opacity: 1;
+        transition: opacity 140ms ease-in-out;
+        max-height: 70vh;
+      }
+      #sign-video.sign-fade {
+        opacity: 1;
+      }
+      @keyframes _rxSlideIn {
+        from { opacity: 0; transform: translateX(60px); }
+        to   { opacity: 1; transform: translateX(0); }
+      }
+      #signStatusOverlay {
+        color: #fff;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* keep button prominent but not overpowering */
+      #repeatSentenceBtn {
+        min-width: 260px;
+      }
+
+      /* --- EMERGENCY / EMOTION DETECTION UI --- */
+      #emotionBadge {
+        display: none;
+      }
+      #emergency-modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        z-index: 99999;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        box-sizing: border-box;
+      }
+      #emergency-modal.show {
+        display: flex;
+      }
+      .emergency-card {
+        width: min(520px, 100%);
+        background: #fff;
+        border-radius: 14px;
+        padding: 18px;
+        border: 2px solid #dc3545;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+      }
+      .emergency-title {
+        font-weight: 800;
+        color: #dc3545;
+        margin-bottom: 8px;
+      }
+      .emergency-sub {
+        color: #495057;
+        font-size: 0.95rem;
+        margin-bottom: 14px;
+      }
+      .emergency-count {
+        font-size: 2.2rem;
+        font-weight: 900;
+        text-align: center;
+        margin: 10px 0 14px;
+      }
+
+      #hospitals-modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.72);
+        z-index: 99998;
+        display: none;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 20px;
+        box-sizing: border-box;
+        overflow-y: auto;
+      }
+      #hospitals-modal.show { display: flex; }
+      .hospitals-card {
+        width: min(620px, 100%);
+        background: #fff;
+        border-radius: 14px;
+        padding: 20px;
+        border: 2px solid #fd7e14;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        margin: auto;
+      }
+      .hospitals-title {
+        font-weight: 800;
+        color: #fd7e14;
+        font-size: 1.1rem;
+        margin-bottom: 4px;
+      }
+      .hospitals-sub {
+        color: #6c757d;
+        font-size: 0.85rem;
+        margin-bottom: 14px;
+      }
+      .hospital-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: #fff8f0;
+        border: 1px solid #fde8cf;
+        margin-bottom: 8px;
+      }
+      .hospital-row:last-child { margin-bottom: 0; }
+      .hospital-rank {
+        font-size: 1.3rem;
+        font-weight: 900;
+        color: #fd7e14;
+        min-width: 28px;
+        text-align: center;
+      }
+      .hospital-info { flex: 1; min-width: 0; }
+      .hospital-name { font-weight: 700; font-size: 0.92rem; color: #212529; }
+      .hospital-meta { font-size: 0.78rem; color: #6c757d; margin-top: 2px; }
+
+      #local-player {
+        position: absolute;
+        bottom: 20px;
+        right: 20px;
+        width: 160px;
+        height: 120px;
+        background: #222;
+        border: 2px solid white;
+        border-radius: 8px;
+        z-index: 10;
+        box-shadow: 0 5px 15px rgba(0, 0, 0, 0.5);
+      }
+
+      /* --- CONTROLS & CHAT --- */
+      #controls-section {
+        flex: 0 0 350px;
+        background: #ffffff;
+        overflow-y: hidden;
+        display: flex;
+        flex-direction: column;
+        border-left: 4px solid #0d6efd;
+      }
+      #chat-log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 15px;
+        background: #f8f9fa;
+        scroll-behavior: smooth;
+      }
+      .chat-bubble {
+        padding: 12px;
+        border-radius: 12px;
+        margin-bottom: 10px;
+        max-width: 85%;
+      }
+      .bubble-me {
+        background: #e7f1ff;
+        border-right: 5px solid #0d6efd;
+        margin-left: auto;
+      }
+      .bubble-other {
+        background: #ffffff;
+        border-left: 5px solid #28a745;
+        margin-right: auto;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+      }
+      .risk-critical {
+        border-color: #dc3545 !important;
+        background-color: #fff5f5;
+      }
+      .translation-text {
+        color: #212529;
+        font-weight: 600;
+        font-size: 1.1rem;
+      }
+      .meta-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.8rem;
+        color: #6c757d;
+        margin-bottom: 5px;
+        font-weight: 700;
+      }
+
+      /* Controls Bar at Bottom */
+      .stop-btn-container {
+        padding: 15px;
+        background: #fff;
+        border-top: 1px solid #dee2e6;
+        display: flex;
+        gap: 15px;
+        justify-content: center;
+      }
+
+      /* Mute Button Styles */
+      .btn-circle {
+        width: 50px;
+        height: 50px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.2rem;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+        transition: all 0.3s ease;
+      }
+      .btn-circle:hover {
+        transform: scale(1.05);
+      }
+      .mute-active {
+        background-color: #dc3545;
+        color: white;
+        border: none;
+      }
+      .mute-inactive {
+        background-color: #f8f9fa;
+        color: #333;
+        border: 1px solid #ccc;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="alert-area" class="alert alert-danger shadow fw-bold"></div>
+
+    <div id="landing-page">
+      <div class="setup-card">
+        <div
+          style="
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            color: #6c757d;
+            font-size: 0.8rem;
+          "
+        >
+          Server: <span id="server-dot" class="status-indicator dot-red"></span>
+        </div>
+        <h3 class="fw-bold text-center mb-4">🏥 Tele-Health Setup</h3>
+
+        <label class="form-label fw-bold text-muted small"
+          >SELECT YOUR ROLE</label
+        >
+        <div class="d-flex flex-column gap-2 mb-3">
+          <button class="role-btn active" onclick="setRole('doctor', this)">
+            <span class="role-icon">👨‍⚕️</span>
+            <div>
+              <div class="fw-bold">Doctor (Moderator)</div>
+              <small class="text-muted">Starts the session</small>
+            </div>
+          </button>
+          <button class="role-btn" onclick="setRole('patient', this)">
+            <span class="role-icon">😷</span>
+            <div>
+              <div class="fw-bold">Patient</div>
+              <small class="text-muted">Joins existing session</small>
+            </div>
+          </button>
+        </div>
+
+        <label class="form-label fw-bold text-muted small">I SPEAK...</label>
+        <select id="userLang" class="form-select form-select-lg mb-3 bg-light">
+          <option value="en">English (US)</option>
+          <option value="ta">Tamil (தமிழ்)</option>
+        </select>
+
+        <label class="form-label fw-bold text-muted small">ROOM ID</label>
+        <input
+          type="text"
+          id="roomName"
+          class="form-control form-control-lg mb-4"
+          value="MedicalRoom101"
+        />
+
+        <button
+          id="joinBtn"
+          class="btn btn-primary w-100 py-3 fw-bold shadow"
+          onclick="attemptJoin()"
+          disabled
+        >
+          Connecting to Server...
+        </button>
+      </div>
+    </div>
+
+    <div id="main-container" class="main-container d-none">
+      
+      <div id="doctor-tools">
+        <h5 class="fw-bold mb-3">🩺 Doctor's Tools</h5>
+        
+        <div class="tool-card">
+          <h6>🧬 Cancer Screening</h6>
+          <input type="file" id="cancerInput" class="form-control form-control-sm mb-2" accept="image/*" />
+          <button class="btn btn-sm btn-outline-primary w-100" onclick="analyzeCancer()">Analyze Scan</button>
+          <div id="cancerResult" class="mt-2 small fw-bold"></div>
+        </div>
+
+        <div class="tool-card">
+          <h6>📄 Medical Report Analyzer</h6>
+          <input type="file" id="reportInput" class="form-control form-control-sm mb-2" accept="image/*, application/pdf" />
+          <button class="btn btn-sm btn-outline-primary w-100" onclick="analyzeReport()">Analyze Report</button>
+          <div id="reportResult" class="mt-2 small text-muted"></div>
+        </div>
+
+        <div class="tool-card">
+          <h6>🤒 Symptom Checker</h6>
+          <textarea id="symptomInput" class="form-control form-control-sm mb-2" rows="2" placeholder="Patient symptoms..."></textarea>
+          <button class="btn btn-sm btn-outline-primary w-100" onclick="checkSymptoms()">Check Symptoms</button>
+          <div id="symptomResult" class="mt-2 small text-muted"></div>
+        </div>
+
+        <div class="tool-card">
+          <h6>🤟 Sign Language Translator</h6>
+          <textarea
+            id="signInput"
+            class="form-control form-control-sm mb-2"
+            rows="3"
+            placeholder="Type a short sentence (e.g., chest pain, I have fever)"
+          ></textarea>
+          <button class="btn btn-sm btn-outline-primary w-100" onclick="translateToSigns()">
+            Translate
+          </button>
+          <div id="signDoctorStatus" class="mt-2 small text-muted"></div>
+        </div>
+
+        <div class="tool-card">
+          <h6>📝 Prescription</h6>
+          <div class="mb-2">
+            <input type="text" id="rx_patient" class="form-control form-control-sm mb-1" placeholder="Patient Name *">
+            <input type="text" id="rx_doctor" class="form-control form-control-sm mb-1" placeholder="Doctor Name *">
+            <input type="date" id="rx_date" class="form-control form-control-sm mb-1">
+            <textarea id="rx_medicines" class="form-control form-control-sm mb-1" rows="3" placeholder="Medicines & dosage (one per line)&#10;e.g. Paracetamol 500mg - 2x daily"></textarea>
+            <textarea id="rx_notes" class="form-control form-control-sm mb-1" rows="2" placeholder="Additional notes / instructions"></textarea>
+          </div>
+          <button class="btn btn-sm btn-success w-100" onclick="sendPrescriptionToPatient()">
+            📤 Send Prescription to Patient
+          </button>
+          <div id="rxStatus" class="mt-1 small text-muted"></div>
+        </div>
+      </div>
+
+      <div id="video-section">
+        <div id="remote-player-container"></div>
+        <div id="local-player"></div>
+
+        <!-- Sign language playback (Patient side) -->
+        <div id="sign-overlay">
+          <button
+            id="closeSignOverlayBtn"
+            class="btn btn-outline-light btn-sm"
+            onclick="closeSignOverlay()"
+            type="button"
+          >
+            Close
+          </button>
+          <div class="sign-video-wrap">
+            <video
+              id="sign-video"
+              class="sign-video"
+              playsinline
+              muted
+              controls="false"
+            ></video>
+            <video id="sign-preload-buf" playsinline muted style="display:none;"></video>
+            <div id="signStatusOverlay">Waiting for sign playback...</div>
+            <button id="repeatSentenceBtn" class="btn btn-primary d-none" onclick="repeatSentence()">
+              Repeat Sentence
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div id="controls-section">
+        <div
+          class="d-flex justify-content-between px-3 py-2 bg-white border-bottom align-items-center"
+        >
+          <div>
+            <span class="badge bg-primary" id="roleBadge">User</span>
+            <span class="badge bg-light text-dark border" id="langBadge"
+              >Lang</span
+            >
+          </div>
+          <div class="border rounded px-2 py-1 bg-light">
+            <small class="fw-bold text-muted me-2">PATIENT:</small>
+            <span id="pat-green" class="status-indicator dot-grey"></span
+            ><small class="me-2" style="font-size: 0.75rem">Online</small>
+            <span id="pat-red" class="status-indicator dot-red"></span
+            ><small style="font-size: 0.75rem">Offline</small>
+          </div>
+          <span class="badge bg-dark" id="emotionBadge">Emotion: -</span>
+          <span class="badge bg-secondary" id="aiStatusBadge">AI Idle</span>
+        </div>
+
+        <div id="chat-log">
+          <div class="text-center text-muted mt-5 small">
+            <p>Secure connection established...</p>
+            <p>Waiting for video stream...</p>
+          </div>
+        </div>
+
+        <div id="stopControls" class="stop-btn-container">
+          <button
+            id="muteBtn"
+            class="btn btn-circle mute-inactive"
+            onclick="toggleMute()"
+          >
+            <i id="muteIcon" class="fas fa-microphone"></i>
+          </button>
+
+          <button
+            class="btn btn-danger shadow fw-bold rounded-pill px-4"
+            onclick="triggerEndCallAction()"
+          >
+            End Call
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <div id="emergency-modal">
+      <div class="emergency-card">
+        <div class="emergency-title">Emergency alert will be sent</div>
+        <div id="emergencyDesc" class="emergency-sub">
+          Critical condition detected. Sending alert in <b>5</b> seconds…
+        </div>
+        <div id="emergencyCountdown" class="emergency-count">5</div>
+        <div class="d-flex gap-2 justify-content-end">
+          <button class="btn btn-outline-secondary" onclick="cancelEmergencyAlert()">Cancel</button>
+          <button class="btn btn-danger" onclick="sendEmergencyAlertNow()">Send now</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="hospitals-modal">
+      <div class="hospitals-card">
+        <div class="hospitals-title">🚨 Patient Unconscious — Nearest Hospitals</div>
+        <div id="hospitalsModalSub" class="hospitals-sub">Finding nearest emergency hospitals…</div>
+        <div id="hospitalsList"></div>
+        <div class="d-flex justify-content-end mt-3">
+          <button class="btn btn-sm btn-outline-secondary" onclick="document.getElementById('hospitals-modal').classList.remove('show')">Close</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      let recognizer, synthesizer, player;
+      let socket = io();
+      socket.on('connect', () => console.log('[Socket] connected — id=' + socket.id));
+      socket.on('disconnect', (r) => console.log('[Socket] disconnected —', r));
+      let myRole = "doctor";
+      let myLang = "en";
+      let currentRoom = "";
+      let isCallActive = false;
+
+      // AGORA VARIABLES
+      let agoraClient;
+      let localAudioTrack, localVideoTrack;
+
+      // MUTE STATE
+      let isMuted = false;
+
+      let azureToken = "",
+        azureRegion = "";
+      let fullGlossary = [];
+
+      // --- EMOTION DETECTION (PATIENT ONLY) ---
+      let emotionMonitor = {
+        enabled: false,
+        landmarker: null,
+        analyzing: false,
+        lastEmotion: "normal",
+        lastConfidence: 0,
+        criticalStartMs: null,
+        criticalEmotion: null,
+        criticalThresholdSec: 12,
+        confidenceThreshold: 0.7,
+        countdownTimer: null,
+        countdownRemaining: 0,
+        pendingAlert: null,
+        alertInFlight: false,
+        cooldownUntilMs: 0,
+      };
+
+      function setEmotionBadge(text, level) {
+        const el = document.getElementById("emotionBadge");
+        if (!el) return;
+        if (myRole !== "patient") {
+          el.style.display = "none";
+          return;
+        }
+        el.style.display = "inline-block";
+        el.textContent = text;
+        el.className =
+          level === "critical"
+            ? "badge bg-danger"
+            : level === "warn"
+            ? "badge bg-warning text-dark"
+            : "badge bg-dark";
+        el.id = "emotionBadge";
+      }
+
+      async function initEmotionModelOnce() {
+        if (emotionMonitor.landmarker) return;
+        await window.__MP_TASKS.load();
+        const { FilesetResolver, FaceLandmarker } = window.__MP_TASKS;
+        const fileset = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+        emotionMonitor.landmarker = await FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            // Pre-trained model from MediaPipe
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+          outputFaceBlendshapes: true,
+        });
+      }
+
+      function _blendScore(blendshapes, name) {
+        if (!blendshapes || !blendshapes.length) return 0;
+        const cats = blendshapes[0].categories || [];
+        const item = cats.find((c) => c.categoryName === name);
+        return item ? item.score : 0;
+      }
+
+      function classifyEmotionFromBlendshapes(blendshapes) {
+        // Simple heuristic mapping from facial blendshapes -> emotion classes.
+        // Output: {emotion, confidence}
+        const eyeClosed =
+          (_blendScore(blendshapes, "eyeBlinkLeft") + _blendScore(blendshapes, "eyeBlinkRight")) / 2;
+        const mouthOpen =
+          (_blendScore(blendshapes, "jawOpen") + _blendScore(blendshapes, "mouthFunnel")) / 2;
+        const browInnerUp = _blendScore(blendshapes, "browInnerUp");
+        const browDown =
+          (_blendScore(blendshapes, "browDownLeft") + _blendScore(blendshapes, "browDownRight")) / 2;
+        const lipStretch =
+          (_blendScore(blendshapes, "mouthStretchLeft") + _blendScore(blendshapes, "mouthStretchRight")) / 2;
+
+        // unconscious: eyes mostly closed AND low mouth movement
+        const unconsciousScore = Math.min(1, 0.75 * eyeClosed + 0.25 * (1 - mouthOpen));
+        // panic: mouth open + brow inner up + lip stretch
+        const panicScore = Math.min(1, 0.45 * mouthOpen + 0.35 * browInnerUp + 0.2 * lipStretch);
+        // pain/stress: brow down + mouth open a bit
+        const painScore = Math.min(1, 0.6 * browDown + 0.4 * mouthOpen);
+        const stressScore = Math.min(1, 0.65 * browDown + 0.35 * browInnerUp);
+
+        const candidates = [
+          { emotion: "unconscious", score: unconsciousScore },
+          { emotion: "panic", score: panicScore },
+          { emotion: "pain", score: painScore },
+          { emotion: "stress", score: stressScore },
+          { emotion: "normal", score: 1 - Math.max(painScore, panicScore, unconsciousScore, stressScore) },
+        ].sort((a, b) => b.score - a.score);
+
+        const top = candidates[0];
+        const confidence = Math.max(0, Math.min(1, top.score));
+        return { emotion: top.emotion, confidence };
+      }
+
+      function isCriticalEmotion(emotion) {
+        return emotion === "pain" || emotion === "panic" || emotion === "unconscious";
+      }
+
+      function showEmergencyModal(show) {
+        const modal = document.getElementById("emergency-modal");
+        if (!modal) return;
+        if (show) modal.classList.add("show");
+        else modal.classList.remove("show");
+      }
+
+      function cancelEmergencyAlert() {
+        if (emotionMonitor.countdownTimer) {
+          clearInterval(emotionMonitor.countdownTimer);
+          emotionMonitor.countdownTimer = null;
+        }
+        emotionMonitor.pendingAlert = null;
+        emotionMonitor.alertInFlight = false;
+        showEmergencyModal(false);
+        setEmotionBadge(`Emotion: ${emotionMonitor.lastEmotion} (${Math.round(emotionMonitor.lastConfidence * 100)}%)`, "warn");
+      }
+
+      async function _getLocationSafe() {
+        return await new Promise((resolve) => {
+          if (!navigator.geolocation) return resolve(null);
+          navigator.geolocation.getCurrentPosition(
+            (pos) =>
+              resolve({
+                lat: pos.coords.latitude,
+                lon: pos.coords.longitude,
+                accuracy_m: pos.coords.accuracy,
+              }),
+            () => resolve(null),
+            { enableHighAccuracy: true, timeout: 5000, maximumAge: 10000 }
+          );
+        });
+      }
+
+      async function sendEmergencyAlertNow() {
+        if (!emotionMonitor.pendingAlert) return;
+        if (emotionMonitor.alertInFlight) return;
+        emotionMonitor.alertInFlight = true;
+        const alertPayload = emotionMonitor.pendingAlert;
+        emotionMonitor.pendingAlert = null;
+        showEmergencyModal(false);
+        try {
+          const location = await _getLocationSafe();
+          const body = {
+            room: currentRoom || null,
+            condition: alertPayload.condition,
+            confidence: alertPayload.confidence,
+            timestamp_ms: Date.now(),
+            location,
+            patient_id: window._patientId || currentRoom || null,
+          };
+          // 1. Socket emit → real-time hospital lookup for doctor (fast, no OSRM)
+          socket.emit("patient_location", {
+            lat:        location ? location.lat : null,
+            lng:        location ? location.lon : null,
+            room:       currentRoom || null,
+            condition:  alertPayload.condition,
+            patient_id: window._patientId || currentRoom || null,
+          });
+          console.log("[Emergency] patient_location emitted via socket");
+
+          // 2. HTTP POST → Twilio SMS to contacts (runs independently)
+          const resp = await fetch("/alert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const result = await resp.json().catch(() => ({}));
+          if (resp.ok && result.twilio?.sent) {
+            const n = result.contacts_notified || 1;
+            console.log(`[Emergency] SMS sent — ${n} contact(s) notified`, result.twilio.results);
+            setEmotionBadge(`Emergency sent: ${alertPayload.condition}`, "critical");
+          } else {
+            console.error("[Emergency] Alert POST failed or Twilio error:", result);
+            setEmotionBadge(`Emergency FAILED: ${result?.twilio?.reason || resp.status}`, "critical");
+          }
+        } catch (e) {
+          console.error(e);
+          setEmotionBadge("Emergency send failed", "critical");
+        } finally {
+          // Prevent repeated countdowns while the patient remains in a critical expression.
+          // Require emotion to drop back to non-critical to trigger again after cooldown.
+          emotionMonitor.cooldownUntilMs = Date.now() + 60_000; // 60s cooldown
+          emotionMonitor.criticalStartMs = null;
+          emotionMonitor.criticalEmotion = null;
+          emotionMonitor.alertInFlight = false;
+        }
+      }
+
+      function startEmergencyCountdown(condition, confidence) {
+        if (emotionMonitor.countdownTimer) return; // already counting down
+        if (emotionMonitor.alertInFlight) return;
+        if (Date.now() < (emotionMonitor.cooldownUntilMs || 0)) return;
+        emotionMonitor.pendingAlert = { condition, confidence };
+
+        emotionMonitor.countdownRemaining = 5;
+        const cEl = document.getElementById("emergencyCountdown");
+        const dEl = document.getElementById("emergencyDesc");
+        if (cEl) cEl.textContent = String(emotionMonitor.countdownRemaining);
+        if (dEl) dEl.innerHTML = `Critical condition detected: <b>${condition}</b>. Sending alert in <b>5</b> seconds…`;
+        showEmergencyModal(true);
+
+        emotionMonitor.countdownTimer = setInterval(() => {
+          emotionMonitor.countdownRemaining -= 1;
+          if (cEl) cEl.textContent = String(Math.max(0, emotionMonitor.countdownRemaining));
+          if (emotionMonitor.countdownRemaining <= 0) {
+            clearInterval(emotionMonitor.countdownTimer);
+            emotionMonitor.countdownTimer = null;
+            // Auto-send once when countdown hits 0.
+            sendEmergencyAlertNow();
+          }
+        }, 1000);
+      }
+
+      function _getAnalysisStreamVideoEl() {
+        // Prefer Agora camera track to avoid double camera usage.
+        try {
+          if (localVideoTrack && typeof localVideoTrack.getMediaStreamTrack === "function") {
+            const track = localVideoTrack.getMediaStreamTrack();
+            const stream = new MediaStream([track]);
+            const v = document.createElement("video");
+            v.srcObject = stream;
+            v.muted = true;
+            v.playsInline = true;
+            v.autoplay = true;
+            return v;
+          }
+        } catch (_) {}
+        return null;
+      }
+
+      async function startEmotionMonitor(retryCount = 0) {
+        if (myRole !== "patient") return;
+        if (emotionMonitor.analyzing) return;
+
+        await initEmotionModelOnce();
+
+        const videoEl = _getAnalysisStreamVideoEl();
+        if (!videoEl) {
+          if (retryCount < 10) {
+            console.warn(`[Emotion] No video track yet — retry ${retryCount + 1}/10 in 2s`);
+            setEmotionBadge("Emotion: waiting for camera…", "warn");
+            setTimeout(() => startEmotionMonitor(retryCount + 1), 2000);
+          } else {
+            console.warn("[Emotion] Video track unavailable after 10 retries. Monitor not started.");
+            setEmotionBadge("Emotion: unavailable", "warn");
+          }
+          return;
+        }
+
+        emotionMonitor.analyzing = true;
+        emotionMonitor.enabled = true;
+
+        await videoEl.play().catch(() => {});
+        const landmarker = emotionMonitor.landmarker;
+
+        const loop = async () => {
+          if (!emotionMonitor.enabled || !isCallActive || myRole !== "patient") {
+            emotionMonitor.analyzing = false;
+            return;
+          }
+
+          try {
+            const now = performance.now();
+            const result = landmarker.detectForVideo(videoEl, now);
+            const hasFace = result && result.faceBlendshapes && result.faceBlendshapes.length > 0;
+
+            if (!hasFace) {
+              emotionMonitor.lastEmotion = "normal";
+              emotionMonitor.lastConfidence = 0;
+              emotionMonitor.criticalStartMs = null;
+              emotionMonitor.criticalEmotion = null;
+              setEmotionBadge("Emotion: no face", "warn");
+              requestAnimationFrame(loop);
+              return;
+            }
+
+            const { emotion, confidence } = classifyEmotionFromBlendshapes(result.faceBlendshapes);
+            emotionMonitor.lastEmotion = emotion;
+            emotionMonitor.lastConfidence = confidence;
+
+            const critical = isCriticalEmotion(emotion) && confidence >= emotionMonitor.confidenceThreshold;
+
+            if (critical) {
+              setEmotionBadge(`Emotion: ${emotion} (${Math.round(confidence * 100)}%)`, "critical");
+
+              const nowMs = Date.now();
+              if (emotionMonitor.criticalEmotion !== emotion) {
+                emotionMonitor.criticalEmotion = emotion;
+                emotionMonitor.criticalStartMs = nowMs;
+              }
+              const elapsedSec = (nowMs - (emotionMonitor.criticalStartMs || nowMs)) / 1000;
+              if (elapsedSec >= emotionMonitor.criticalThresholdSec) {
+                // Only trigger if we are not in cooldown.
+                if (Date.now() >= (emotionMonitor.cooldownUntilMs || 0)) {
+                  startEmergencyCountdown(emotion, confidence);
+                }
+              }
+            } else {
+              emotionMonitor.criticalStartMs = null;
+              emotionMonitor.criticalEmotion = null;
+              setEmotionBadge(`Emotion: ${emotion} (${Math.round(confidence * 100)}%)`, "warn");
+            }
+          } catch (e) {
+            console.error(e);
+          }
+
+          requestAnimationFrame(loop);
+        };
+
+        requestAnimationFrame(loop);
+      }
+
+
+      // --- ISL SIGN LANGUAGE RECOGNITION (BACKEND CNN) ---
+      let islSignMonitor = {
+        running: false,
+        lastSentWord: "",
+        lastSentAtMs: 0,
+        minSendGapMs: 1500,
+      };
+
+      async function startISLSignRecognitionMonitor() {
+        if (myRole !== "patient") return;
+        if (islSignMonitor.running) return;
+        islSignMonitor.running = true;
+
+        const videoEl = _getAnalysisStreamVideoEl();
+        if (!videoEl) {
+          islSignMonitor.running = false;
+          return;
+        }
+        await videoEl.play().catch(() => {});
+
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 64; // Match model input size
+        canvas.height = 64;
+
+        const loop = async () => {
+          if (!isCallActive || myRole !== "patient" || !islSignMonitor.running) {
+            islSignMonitor.running = false;
+            return;
+          }
+
+          const nowMs = Date.now();
+          if (nowMs - islSignMonitor.lastSentAtMs >= islSignMonitor.minSendGapMs) {
+            try {
+              // Draw current video frame to canvas
+              ctx.drawImage(videoEl, 0, 0, 64, 64);
+              const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+              const formData = new FormData();
+              formData.append('frame', blob, 'frame.jpg');
+
+              const res = await fetch('/predict_isl', {
+                method: 'POST',
+                body: formData,
+              });
+              const data = await res.json();
+              const word = (data && data.word) || "unknown";
+              const conf = Math.round(((data && data.confidence) || 0) * 100);
+
+              if (word && word !== "unknown" && word !== islSignMonitor.lastSentWord) {
+                islSignMonitor.lastSentWord = word;
+                islSignMonitor.lastSentAtMs = nowMs;
+                socket.emit("send_patient_sign_text", {
+                  room: currentRoom,
+                  word,
+                  confidence: conf,
+                  gesture: "isl_cnn",
+                  ts: nowMs,
+                });
+                addBubble(`ISL Sign recognized: ${word}`, "NORMAL", "me");
+              }
+            } catch (e) {
+              console.error(e);
+            }
+          }
+          requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+      }
+
+      // --- SIGN LANGUAGE TRANSLATOR (Doctor -> Patient) ---
+      // Sign dictionary is fetched from backend to match your actual files in /assets/signs.
+      // It auto-updates when you add new .mp4 files.
+      let SIGN_LANGUAGE_MAP = {};
+      let __SIGN_URL_POOL = [];
+      let __MISSING_TOKEN_TO_URL = {};
+      let __PHRASE_KEYS_BY_LEN = {};
+
+      async function loadSignLanguageMap() {
+        try {
+          const res = await fetch("/signs-map");
+          const data = await res.json();
+          SIGN_LANGUAGE_MAP = data || {};
+
+          // Helpful aliases
+          if (SIGN_LANGUAGE_MAP["consious"] && !SIGN_LANGUAGE_MAP["conscious"]) {
+            SIGN_LANGUAGE_MAP["conscious"] = SIGN_LANGUAGE_MAP["consious"];
+          }
+
+          // Build a stable pool of URLs for deterministic fallbacks
+          const keys = Object.keys(SIGN_LANGUAGE_MAP || {}).sort();
+          __SIGN_URL_POOL = keys.map((k) => SIGN_LANGUAGE_MAP[k]).filter(Boolean);
+          __MISSING_TOKEN_TO_URL = {};
+
+          // Precompute phrase keys (tokens that contain spaces), grouped by word-length
+          __PHRASE_KEYS_BY_LEN = {};
+          keys.forEach((k) => {
+            if (!k.includes(" ")) return;
+            const len = k.split(/\s+/).filter(Boolean).length;
+            if (len < 2) return;
+            if (!__PHRASE_KEYS_BY_LEN[len]) __PHRASE_KEYS_BY_LEN[len] = new Set();
+            __PHRASE_KEYS_BY_LEN[len].add(k);
+          });
+        } catch (e) {
+          console.error("Failed to load /signs-map", e);
+          SIGN_LANGUAGE_MAP = {};
+          __SIGN_URL_POOL = [];
+          __MISSING_TOKEN_TO_URL = {};
+          __PHRASE_KEYS_BY_LEN = {};
+        }
+      }
+
+      let signWords = [];
+      let signUnknownWords = [];
+      let signIndex = 0;
+      let signRepeatWords = [];
+      let isSignPlaying = false;
+
+      const signVideoEl = document.getElementById("sign-video");
+
+      function normalizeInputText(inputText) {
+        // Lowercase, remove punctuation, then split by whitespace.
+        const text = (inputText || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, " ");
+        return text
+          .split(/\s+/)
+          .map((w) => w.trim())
+          .filter(Boolean);
+      }
+
+      function tokenizeWithPhrases(inputText) {
+        const words = normalizeInputText(inputText);
+        if (!words.length) return [];
+
+        // Try longest phrase match first (max 5-word phrases to keep it fast)
+        const maxLen = Math.min(
+          5,
+          Math.max(1, ...Object.keys(__PHRASE_KEYS_BY_LEN || {}).map((n) => parseInt(n, 10)).filter(Boolean))
+        );
+
+        const tokens = [];
+        let i = 0;
+        while (i < words.length) {
+          let matched = null;
+          for (let L = maxLen; L >= 2; L--) {
+            const set = __PHRASE_KEYS_BY_LEN[L];
+            if (!set) continue;
+            const cand = words.slice(i, i + L).join(" ");
+            if (set.has(cand)) {
+              matched = cand;
+              i += L;
+              break;
+            }
+          }
+          if (matched) tokens.push(matched);
+          else {
+            tokens.push(words[i]);
+            i += 1;
+          }
+        }
+        return tokens;
+      }
+
+      function _hashStringToInt(str) {
+        // Simple deterministic hash for fallback selection
+        let h = 2166136261;
+        for (let i = 0; i < str.length; i++) {
+          h ^= str.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        return Math.abs(h >>> 0);
+      }
+
+      function getSignSrcForToken(token) {
+        if (!token) return null;
+        const key = String(token).toLowerCase().trim();
+        if (SIGN_LANGUAGE_MAP[key]) return SIGN_LANGUAGE_MAP[key];
+
+        // Deterministic "random" fallback: always maps same token -> same existing URL
+        if (__MISSING_TOKEN_TO_URL[key]) return __MISSING_TOKEN_TO_URL[key];
+        if (!__SIGN_URL_POOL.length) return null;
+        const idx = _hashStringToInt(key) % __SIGN_URL_POOL.length;
+        __MISSING_TOKEN_TO_URL[key] = __SIGN_URL_POOL[idx];
+        return __MISSING_TOKEN_TO_URL[key];
+      }
+
+      function getMappedWordsAndUnknown(words) {
+        const mapped = [];
+        const unknown = [];
+        words.forEach((w) => {
+          // Always include token; if missing, we will fall back to a deterministic random sign video.
+          if (SIGN_LANGUAGE_MAP[w]) mapped.push(w);
+          else {
+            // If we have at least one sign video in pool, still map it (fallback).
+            if (__SIGN_URL_POOL.length) mapped.push(w);
+            else unknown.push(w);
+          }
+        });
+        return { mapped, unknown };
+      }
+
+      function setSignOverlayVisible(visible) {
+        const overlay = document.getElementById("sign-overlay");
+        if (!overlay) return;
+        if (visible) overlay.classList.add("show");
+        else overlay.classList.remove("show");
+      }
+
+      function closeSignOverlay() {
+        setSignOverlayVisible(false);
+        isSignPlaying = false;
+        const repeatBtn = document.getElementById("repeatSentenceBtn");
+        if (repeatBtn) repeatBtn.classList.add("d-none");
+        try {
+          if (signVideoEl) {
+            signVideoEl.pause();
+            signVideoEl.removeAttribute("src");
+            signVideoEl.load();
+          }
+        } catch (_) {}
+      }
+
+      // Hidden preload buffer for the next word's video
+      const _signBuf = document.getElementById('sign-preload-buf');
+      let _bufSrc = null; // src currently loaded in buffer
+
+      function _preloadNextSign(index) {
+        if (!_signBuf || index >= signWords.length) return;
+        const src = getSignSrcForToken(signWords[index]);
+        if (!src || src === _bufSrc) return;
+        _bufSrc = src;
+        _signBuf.src = src;
+        _signBuf.load();
+      }
+
+      function updateDoctorSignStatus(done) {
+        const el = document.getElementById('signDoctorStatus');
+        if (!el) return;
+        el.textContent = done ? 'Status: Idle' : `Status: Playing (${signIndex + 1}/${signWords.length})`;
+      }
+
+      function updatePatientSignOverlay(active) {
+        const el = document.getElementById('signStatusOverlay');
+        if (!el) return;
+        el.textContent = active ? 'Sign language playback...' : 'Waiting for sign playback...';
+      }
+
+      function fadeToNextSign(index) {
+        if (!signVideoEl) return;
+        if (index >= signWords.length) {
+          isSignPlaying = false;
+          updateDoctorSignStatus(true);
+          updatePatientSignOverlay(false);
+          const repeatBtn = document.getElementById('repeatSentenceBtn');
+          if (repeatBtn && myRole === 'patient') repeatBtn.classList.remove('d-none');
+          return;
+        }
+
+        signIndex = index;
+        const src = getSignSrcForToken(signWords[signIndex]);
+        if (!src) { fadeToNextSign(signIndex + 1); return; }
+
+        isSignPlaying = true;
+        updateDoctorSignStatus(false);
+        updatePatientSignOverlay(true);
+        const repeatBtn = document.getElementById('repeatSentenceBtn');
+        if (repeatBtn) repeatBtn.classList.add('d-none');
+
+        const playFromSrc = (videoSrc) => {
+          signVideoEl.src = videoSrc;
+          signVideoEl.load();
+          const onReady = () => {
+            signVideoEl.removeEventListener('loadeddata', onReady);
+            signVideoEl.play().catch(() => {});
+            // Immediately start buffering the word AFTER next
+            _preloadNextSign(signIndex + 1);
+          };
+          signVideoEl.addEventListener('loadeddata', onReady);
+        };
+
+        // If the buffer already has this src loaded, swap instantly (no reload)
+        if (_signBuf && _bufSrc === src && _signBuf.readyState >= 2) {
+          signVideoEl.src = src;
+          signVideoEl.play().catch(() => {});
+          _preloadNextSign(signIndex + 1);
+        } else {
+          playFromSrc(src);
+        }
+      }
+
+      function startSignPlayback(words, unknownWords = [], options = {}) {
+        const showOverlay = options.showOverlay === true;
+
+        signUnknownWords = unknownWords || [];
+        signRepeatWords = (words || []).slice();
+        signWords = (words || []).slice();
+        signIndex = 0;
+        isSignPlaying = false;
+        _bufSrc = null; // reset preload buffer
+
+        if (signWords.length === 0) {
+          updateDoctorSignStatus(true);
+          updatePatientSignOverlay(false);
+          if (myRole === "doctor") {
+            const el = document.getElementById("signDoctorStatus");
+            if (el) el.textContent = `Status: No mapped words found (ignored: ${signUnknownWords.join(", ") || "none"})`;
+          }
+          return;
+        }
+
+        if (myRole === "patient") {
+          setSignOverlayVisible(showOverlay);
+          updatePatientSignOverlay(true);
+        } else {
+          setSignOverlayVisible(false);
+        }
+
+        // Ensure repeat button is hidden while playing
+        const repeatBtn = document.getElementById("repeatSentenceBtn");
+        if (repeatBtn) repeatBtn.classList.add("d-none");
+
+        fadeToNextSign(0);
+      }
+
+      // Exposed to button click: Doctor View
+      function translateToSigns() {
+        if (!currentRoom) return;
+
+        const rawText = document.getElementById("signInput")?.value || "";
+        const words = tokenizeWithPhrases(rawText);
+        const { mapped, unknown } = getMappedWordsAndUnknown(words);
+
+        // Doctor status should show what is currently being played.
+        startSignPlayback(mapped, unknown, { showOverlay: false });
+
+        // Send the normalized word list to the patient.
+        socket.emit("send_sign_sentence", {
+          room: currentRoom,
+          words: mapped,
+          unknown: unknown,
+        });
+      }
+
+      // Set today's date on load
+      document.addEventListener('DOMContentLoaded', () => {
+        const rxDate = document.getElementById('rx_date');
+        if (rxDate) rxDate.valueAsDate = new Date();
+      });
+
+      async function sendPrescriptionToPatient() {
+        const patient = document.getElementById('rx_patient').value.trim();
+        const doctor  = document.getElementById('rx_doctor').value.trim();
+        const date    = document.getElementById('rx_date').value;
+        const meds    = document.getElementById('rx_medicines').value.trim();
+        const notes   = document.getElementById('rx_notes').value.trim();
+        const status  = document.getElementById('rxStatus');
+
+        if (!patient || !doctor) {
+          status.style.color = 'red';
+          status.innerText = 'Patient & Doctor name are required.';
+          return;
+        }
+        if (!meds) {
+          status.style.color = 'red';
+          status.innerText = 'Please enter at least one medicine.';
+          return;
+        }
+
+        status.style.color = '#666';
+        status.innerText = 'Sending to patient...';
+
+        const medLines = meds.split('\n').filter(l => l.trim());
+
+        try {
+          const res = await fetch('/send_prescription', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              patientName: patient,
+              doctorName: doctor,
+              prescriptionDate: date,
+              medicineName: medLines,
+              notes: notes,
+              room: currentRoom
+            })
+          });
+
+          const data = await res.json();
+          if (data.success) {
+            status.style.color = 'green';
+            status.innerText = '✅ Prescription sent to patient!';
+          } else {
+            status.style.color = 'red';
+            status.innerText = '❌ Error sending prescription.';
+          }
+        } catch(e) {
+          status.style.color = 'red';
+          status.innerText = '❌ Network error.';
+        }
+      }
+
+      // Doctor receives nearest hospitals when patient is unconscious
+      socket.on('nearest_hospitals', (data) => {
+        console.log('[nearest_hospitals] received — role=' + myRole, data);
+        if (myRole !== 'doctor') return;
+
+        const modal = document.getElementById('hospitals-modal');
+        const sub   = document.getElementById('hospitalsModalSub');
+        const list  = document.getElementById('hospitalsList');
+        if (!modal || !list) return;
+
+        const hospitals  = data.hospitals  || [];
+        const condition  = (data.condition || 'UNCONSCIOUS').toUpperCase();
+        const patientId  = data.patient_id || 'Unknown';
+        const loc        = data.location;
+        const mapsLink   = loc && loc.lat ? `https://maps.google.com/?q=${loc.lat},${loc.lon}` : null;
+
+        // Header line: "Patient: ID 123 | Condition: UNCONSCIOUS"
+        sub.innerHTML =
+          `Patient: <b>${patientId}</b> &nbsp;|&nbsp; Condition: <b style="color:#dc3545">${condition}</b>` +
+          (mapsLink ? ` &nbsp;|&nbsp; <a href="${mapsLink}" target="_blank" style="color:#fd7e14;">📍 View on map</a>` : '');
+
+        list.innerHTML = '';
+        if (hospitals.length === 0) {
+          list.innerHTML = '<p class="text-muted small mt-2">No hospitals found near patient location.</p>';
+        } else {
+          hospitals.forEach((h, i) => {
+            const row = document.createElement('div');
+            row.className = 'hospital-row';
+            // "1. Apollo Hospital — 2.1 km — ETA 5 mins — [Call Ambulance]"
+            row.innerHTML = `
+              <div class="hospital-rank">${i + 1}</div>
+              <div class="hospital-info">
+                <div class="hospital-name">${h.name}</div>
+                <div class="hospital-meta">
+                  ${h.dist} km &mdash; ETA ${h.time}
+                  ${h.address ? '&nbsp;&middot;&nbsp;' + h.address : ''}
+                </div>
+              </div>
+              <a href="tel:${h.phone}"
+                 class="btn btn-sm btn-danger ms-auto"
+                 style="white-space:nowrap;font-size:0.8rem;">
+                � Call Ambulance
+              </a>`;
+            list.appendChild(row);
+          });
+        }
+
+        modal.classList.add('show');
+      });
+
+      // Store received prescriptions by ID
+      const _rxStore = {};
+      let _rxCounter = 0;
+
+      // Patient receives prescription text → shows card with Download button
+      socket.on('receive_prescription', (data) => {
+        if (myRole !== 'patient') return;
+        const log = document.getElementById('chat-log');
+        if (!log) return;
+
+        // Toast notification
+        _showPrescriptionToast('New prescription from Dr. ' + data.doctor_name);
+
+        const rxId = 'rx_' + (++_rxCounter);
+        _rxStore[rxId] = data;
+
+        const div = document.createElement('div');
+        div.style.cssText = 'background:#e8f5e9;border:2px solid #4caf50;border-radius:10px;padding:12px;margin:10px 0;text-align:center;';
+
+        const title = document.createElement('div');
+        title.style.cssText = 'font-weight:700;color:#2e7d32;margin-bottom:4px;font-size:1rem;';
+        title.textContent = '📋 Prescription from Dr. ' + data.doctor_name;
+
+        const meta = document.createElement('div');
+        meta.style.cssText = 'font-size:0.82rem;color:#555;margin-bottom:8px;';
+        meta.textContent = 'Date: ' + data.date + '  ·  Patient: ' + data.patient_name;
+
+        const medList = document.createElement('div');
+        medList.style.cssText = 'text-align:left;font-size:0.85rem;margin-bottom:10px;color:#333;';
+        (data.medicines || []).forEach((m, i) => {
+          const li = document.createElement('div');
+          li.textContent = (i + 1) + '. ' + m;
+          medList.appendChild(li);
+        });
+        if (data.notes) {
+          const note = document.createElement('div');
+          note.style.cssText = 'font-size:0.82rem;color:#666;margin-top:4px;font-style:italic;';
+          note.textContent = 'Note: ' + data.notes;
+          medList.appendChild(note);
+        }
+
+        const btn = document.createElement('button');
+        btn.style.cssText = 'background:#4caf50;color:white;padding:8px 20px;border-radius:8px;border:none;font-weight:600;cursor:pointer;font-size:0.9rem;';
+        btn.textContent = '⬇ Download Prescription PDF';
+        btn.addEventListener('click', () => generatePrescriptionPDF(rxId));
+
+        div.appendChild(title);
+        div.appendChild(meta);
+        div.appendChild(medList);
+        div.appendChild(btn);
+        log.appendChild(div);
+        log.scrollTop = log.scrollHeight;
+      });
+
+      // PDF generated entirely on patient side using jsPDF
+      function generatePrescriptionPDF(rxId) {
+        const d = _rxStore[rxId];
+        if (!d) return;
+
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF();
+
+        doc.setFontSize(18);
+        doc.setFont('helvetica', 'bold');
+        doc.text('MEDICAL PRESCRIPTION', 105, 20, { align: 'center' });
+
+        doc.setDrawColor(0, 102, 204);
+        doc.setLineWidth(0.5);
+        doc.line(15, 25, 195, 25);
+
+        doc.setFontSize(11);
+        doc.setFont('helvetica', 'normal');
+        doc.text('Date: ' + d.date, 15, 35);
+        doc.text('Doctor: Dr. ' + d.doctor_name, 15, 43);
+
+        doc.setFont('helvetica', 'bold');
+        doc.text('Patient:', 15, 55);
+        doc.setFont('helvetica', 'normal');
+        doc.text('Name: ' + d.patient_name, 15, 63);
+
+        let y = 75;
+        if (d.medicines && d.medicines.length > 0) {
+          doc.setFont('helvetica', 'bold');
+          doc.text('Medicines:', 15, y); y += 8;
+          doc.setFont('helvetica', 'normal');
+          d.medicines.forEach((m, i) => {
+            doc.text((i + 1) + '. ' + m, 18, y); y += 7;
+          });
+          y += 3;
+        }
+
+        if (d.notes) {
+          doc.setFont('helvetica', 'bold');
+          doc.text('Notes / Instructions:', 15, y); y += 8;
+          doc.setFont('helvetica', 'normal');
+          const lines = doc.splitTextToSize(d.notes, 175);
+          doc.text(lines, 15, y); y += lines.length * 7 + 3;
+        }
+
+        doc.setFontSize(9);
+        doc.setFont('helvetica', 'italic');
+        doc.text('Generated by Tele-Health AI Platform', 105, 285, { align: 'center' });
+
+        doc.save('prescription_' + d.patient_name + '_' + d.date + '.pdf');
+      }
+
+      function _showPrescriptionToast(message) {
+        const existing = document.getElementById('_rxToast');
+        if (existing) existing.remove();
+
+        const toast = document.createElement('div');
+        toast.id = '_rxToast';
+        toast.style.cssText = [
+          'position:fixed', 'top:20px', 'right:20px', 'z-index:9999',
+          'background:#2e7d32', 'color:#fff', 'padding:14px 20px',
+          'border-radius:10px', 'box-shadow:0 4px 16px rgba(0,0,0,0.3)',
+          'font-weight:600', 'font-size:0.95rem', 'max-width:320px',
+          'display:flex', 'align-items:center', 'gap:10px',
+          'animation:_rxSlideIn 0.3s ease'
+        ].join(';');
+
+        const icon = document.createElement('span');
+        icon.textContent = '📋';
+        icon.style.fontSize = '1.3rem';
+
+        const text = document.createElement('span');
+        text.textContent = message;
+
+        const close = document.createElement('button');
+        close.textContent = '×';
+        close.style.cssText = 'background:none;border:none;color:#fff;font-size:1.3rem;cursor:pointer;margin-left:auto;line-height:1;';
+        close.onclick = () => toast.remove();
+
+        toast.appendChild(icon);
+        toast.appendChild(text);
+        toast.appendChild(close);
+        document.body.appendChild(toast);
+
+        setTimeout(() => { if (toast.parentNode) toast.remove(); }, 6000);
+      }
+
+      // Exposed to button click: Patient View
+      function repeatSentence() {
+        if (myRole !== "patient") return;
+        startSignPlayback(signRepeatWords || [], [], { showOverlay: true });
+      }
+
+      if (signVideoEl) {
+        signVideoEl.addEventListener("ended", () => {
+          fadeToNextSign(signIndex + 1);
+        });
+
+        // If a specific sign video is missing/can't play, skip to the next word.
+        signVideoEl.addEventListener("error", () => {
+          fadeToNextSign(signIndex + 1);
+        });
+      }
+
+      // Use ?room= URL param if provided, otherwise generate once and reflect in URL
+      (function () {
+        const params = new URLSearchParams(window.location.search);
+        let roomVal = params.get("room");
+        if (!roomVal) {
+          roomVal = "Room-" + Math.floor(Math.random() * 10000);
+          const newUrl = new URL(window.location.href);
+          newUrl.searchParams.set("room", roomVal);
+          window.history.replaceState({}, "", newUrl.toString());
+        }
+        document.getElementById("roomName").value = roomVal;
+      })();
+
+      // --- SERVER CONNECTION ---
+      socket.on("connect", () => {
+        console.log('[Socket] connected id=' + socket.id + ' room=' + currentRoom);
+        document.getElementById("server-dot").className =
+          "status-indicator dot-green";
+        updateJoinButtonText();
+        // Auto-rejoin room if we were already in a call (handles server restarts)
+        if (currentRoom && isCallActive) {
+          console.log('[Socket] reconnected — re-joining room:', currentRoom);
+          socket.emit("join_request", { room: currentRoom, role: myRole });
+        }
+      });
+      socket.on("disconnect", () => {
+        document.getElementById("server-dot").className =
+          "status-indicator dot-red";
+        document.getElementById("joinBtn").innerText = "Server Disconnected";
+        document.getElementById("joinBtn").disabled = true;
+      });
+
+      function updateJoinButtonText() {
+        const btn = document.getElementById("joinBtn");
+        if (myRole === "doctor") {
+          btn.innerText = "Start Session ➡️";
+          btn.className = "btn btn-primary w-100 py-3 fw-bold shadow";
+        } else {
+          btn.innerText = "Join Session ➡️";
+          btn.className = "btn btn-success w-100 py-3 fw-bold shadow";
+        }
+        btn.disabled = false;
+      }
+
+      function setRole(role, btn) {
+        myRole = role;
+        document
+          .querySelectorAll(".role-btn")
+          .forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        updateJoinButtonText();
+      }
+
+      function showAlert(msg) {
+        const al = document.getElementById("alert-area");
+        al.innerText = msg;
+        al.style.display = "block";
+        setTimeout(() => {
+          al.style.display = "none";
+        }, 4000);
+      }
+
+      function updatePatientStatus(hasPatient) {
+        const green = document.getElementById("pat-green");
+        const red = document.getElementById("pat-red");
+        if (hasPatient) {
+          green.classList.remove("dot-grey");
+          green.classList.add("dot-green");
+          red.classList.remove("dot-red");
+          red.classList.add("dot-grey");
+        } else {
+          green.classList.remove("dot-green");
+          green.classList.add("dot-grey");
+          red.classList.remove("dot-grey");
+          red.classList.add("dot-red");
+        }
+      }
+
+      // --- DOCTOR TOOLS LOGIC ---
+      async function analyzeCancer() {
+        const fileInput = document.getElementById('cancerInput');
+        const resultDiv = document.getElementById('cancerResult');
+        if (!fileInput.files[0]) { alert("Please select a file"); return; }
+        
+        resultDiv.innerHTML = "Processing...";
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        try {
+            const res = await fetch('/predict_cancer', { method: 'POST', body: formData });
+            const data = await res.json();
+            if(data.success) {
+                resultDiv.innerHTML = `<span class="${data.status === 'CANCEROUS' ? 'text-danger' : 'text-success'}">${data.class}</span><br><small>${data.advice}</small>`;
+            } else {
+                resultDiv.innerHTML = "Error analyzing.";
+            }
+        } catch(e) { resultDiv.innerHTML = "Error."; }
+      }
+
+      async function analyzeReport() {
+        const fileInput = document.getElementById('reportInput');
+        const resultDiv = document.getElementById('reportResult');
+        if (!fileInput.files[0]) { alert("Please select a file"); return; }
+        
+        resultDiv.innerHTML = "Processing (Wait)...";
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        try {
+            const res = await fetch('/analyze', { method: 'POST', body: formData });
+            const data = await res.json();
+            if(data.success) {
+                resultDiv.innerHTML = `<a href="${data.pdf_url}" target="_blank">Download Report Summary</a>`;
+            } else {
+                resultDiv.innerHTML = "Error analyzing.";
+            }
+        } catch(e) { resultDiv.innerHTML = "Error."; }
+      }
+
+      async function checkSymptoms() {
+        const text = document.getElementById('symptomInput').value;
+        const resultDiv = document.getElementById('symptomResult');
+        if (!text) return;
+        
+        resultDiv.innerHTML = "Checking...";
+        try {
+            const res = await fetch('/predict_disease', { 
+                method: 'POST', 
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({symptoms: text}) 
+            });
+            const data = await res.json();
+            if(data.success) {
+                const diseases = data.predictions.map(d => d.disease).join(", ");
+                const severity = data.triage.color;
+                resultDiv.innerHTML = `<strong>Possible:</strong> ${diseases}<br><strong>Severity:</strong> ${severity}`;
+            }
+        } catch(e) { resultDiv.innerHTML = "Error."; }
+      }
+
+      // --- JOIN LOGIC ---
+      function attemptJoin() {
+        // 1. UNLOCK AUDIO IMMEDIATELY ON CLICK
+        unlockBrowserAudio();
+
+        currentRoom = document.getElementById("roomName").value;
+        myLang = document.getElementById("userLang").value;
+        const btn = document.getElementById("joinBtn");
+        btn.innerText = "Verifying...";
+        btn.disabled = true;
+
+        socket.emit("join_request", { room: currentRoom, role: myRole });
+      }
+
+      socket.on("join_response", async (data) => {
+        if (!data.allowed) {
+          showAlert(data.message);
+          document.getElementById("joinBtn").disabled = false;
+          updateJoinButtonText();
+          return;
+        }
+
+        isCallActive = true;
+        document.getElementById("landing-page").classList.add("d-none");
+        document.getElementById("main-container").classList.remove("d-none");
+        
+        // SHOW DOCTOR TOOLS IF DOCTOR
+        if (myRole === 'doctor') {
+            document.getElementById("doctor-tools").style.display = "flex";
+        }
+
+        document.getElementById("roleBadge").innerText = myRole.toUpperCase();
+        document.getElementById("langBadge").innerText =
+          myLang === "ta" ? "TAMIL" : "ENGLISH";
+        document.getElementById("aiStatusBadge").innerText = "Connecting AI...";
+
+        // 1. Start Agora Video
+        try {
+          await startAgora(
+            data.agora_app_id,
+            data.agora_token,
+            currentRoom,
+            data.agora_uid
+          );
+        } catch (err) {
+          console.error(err);
+          showAlert("Video Error: " + err.message);
+        }
+
+        // Load sign-language map (for both roles)
+        try {
+          await loadSignLanguageMap();
+        } catch (e) {
+          console.error(e);
+        }
+
+        // 1b. Start patient emotion monitoring (runs locally in browser)
+        if (myRole === "patient") {
+          try {
+            setEmotionBadge("Emotion: starting…", "warn");
+            startEmotionMonitor();
+            startSignRecognitionMonitor();
+          } catch (e) {
+            console.error(e);
+          }
+        }
+
+        // 2. Start Azure AI
+        try {
+          const tokenResponse = await fetch("/get-token");
+          const tokenData = await tokenResponse.json();
+          azureToken = tokenData.token;
+          azureRegion = tokenData.region;
+
+          const glossaryResponse = await fetch("/get-glossary");
+          fullGlossary = await glossaryResponse.json();
+
+          startAzureAI(myLang, azureToken, azureRegion, fullGlossary);
+        } catch (error) {
+          console.error(error);
+          alert("AI Connection Error (Check Console)");
+        }
+      });
+
+      socket.on("status_update", (data) =>
+        updatePatientStatus(data.has_patient)
+      );
+
+      socket.on("receive_patient_sign_text", (data) => {
+        if (myRole !== "doctor" || !isCallActive) return;
+        const word = (data && data.word) || "unknown";
+        const conf = Math.round(((data && data.confidence) || 0) * 100);
+        if (word === "unknown") return;
+        addBubble(`Patient sign: ${word} (${conf}%)`, "NORMAL", "other");
+      });
+
+      // --- SIGN LANGUAGE: Doctor -> Patient ---
+      socket.on("receive_sign_sentence", (data) => {
+        if (myRole !== "patient") return;
+        const words = (data && data.words) || [];
+        const unknown = (data && data.unknown) || [];
+        startSignPlayback(words, unknown, { showOverlay: true });
+      });
+
+      // --- AGORA VIDEO LOGIC ---
+      async function startAgora(appId, token, channel, uid) {
+        agoraClient = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+
+        agoraClient.on("user-published", async (user, mediaType) => {
+          await agoraClient.subscribe(user, mediaType);
+          if (mediaType === "video") {
+            const container = document.getElementById(
+              "remote-player-container"
+            );
+            container.innerHTML = "";
+            const remotePlayer = document.createElement("div");
+            remotePlayer.id = `user-${user.uid}`;
+            remotePlayer.className = "video-player";
+            container.appendChild(remotePlayer);
+            user.videoTrack.play(remotePlayer);
+          }
+          if (mediaType === "audio") {
+            user.audioTrack.play();
+          }
+        });
+
+        agoraClient.on("user-unpublished", (user) => {
+          const player = document.getElementById(`user-${user.uid}`);
+          if (player) player.remove();
+        });
+
+        await agoraClient.join(appId, channel, token, uid);
+        [localAudioTrack, localVideoTrack] =
+          await AgoraRTC.createMicrophoneAndCameraTracks();
+        localVideoTrack.play("local-player");
+        await agoraClient.publish([localAudioTrack, localVideoTrack]);
+      }
+
+      // --- MUTE TOGGLE LOGIC ---
+      function toggleMute() {
+        if (!localAudioTrack) return;
+
+        isMuted = !isMuted;
+
+        // 1. Toggle Agora Audio (Controls what other person hears)
+        localAudioTrack.setEnabled(!isMuted);
+
+        // 2. Update UI
+        const btn = document.getElementById("muteBtn");
+        const icon = document.getElementById("muteIcon");
+
+        if (isMuted) {
+          btn.classList.remove("mute-inactive");
+          btn.classList.add("mute-active");
+          icon.classList.remove("fa-microphone");
+          icon.classList.add("fa-microphone-slash");
+
+          // Visual Indicator
+          document.getElementById("aiStatusBadge").innerText =
+            "Microphone Muted";
+          document.getElementById("aiStatusBadge").className =
+            "badge bg-warning text-dark";
+        } else {
+          btn.classList.add("mute-inactive");
+          btn.classList.remove("mute-active");
+          icon.classList.add("fa-microphone");
+          icon.classList.remove("fa-microphone-slash");
+
+          // Visual Indicator
+          document.getElementById("aiStatusBadge").innerText = "🔴 On Air";
+          document.getElementById("aiStatusBadge").className =
+            "badge bg-danger animate-pulse";
+        }
+      }
+
+      // --- END MEETING LOGIC ---
+      function triggerEndCallAction() {
+        if (myRole === "doctor") {
+          socket.emit("end_meeting", { room: currentRoom });
+        }
+        resetUI();
+      }
+
+      socket.on("meeting_ended", (data) => {
+        if (isCallActive) {
+          alert(data.message);
+          resetUI();
+        }
+      });
+
+      function resetUI() {
+        if (!isCallActive) return;
+        isCallActive = false;
+
+        if (recognizer) {
+          recognizer.stopContinuousRecognitionAsync();
+          recognizer.close();
+        }
+        if (localAudioTrack) {
+          localAudioTrack.close();
+          localVideoTrack.close();
+        }
+        if (agoraClient) {
+          agoraClient.leave();
+        }
+        socket.emit("leave", { room: currentRoom });
+        window.location.reload();
+      }
+
+      // --- AZURE AI LOGIC ---
+      function refineTranslation(original, translated, lang) {
+        let refined = translated;
+        const lowerOriginal = original.toLowerCase();
+        if (lang === "ta") {
+          fullGlossary.forEach((entry) => {
+            const match = entry.tamil_synonyms.some((syn) =>
+              lowerOriginal.includes(syn.toLowerCase())
+            );
+            if (
+              match &&
+              !refined.toLowerCase().includes(entry.english.toLowerCase())
+            ) {
+              refined += ` (${entry.english})`;
+            }
+          });
+        } else {
+          fullGlossary.forEach((entry) => {
+            if (lowerOriginal.includes(entry.english.toLowerCase())) {
+              const preferredTamil = entry.tamil_synonyms[0];
+              if (!refined.includes(preferredTamil)) {
+                refined += ` (${preferredTamil})`;
+              }
+            }
+          });
+        }
+        return refined;
+      }
+
+      function startAzureAI(lang, authToken, region, vocabList) {
+        document.getElementById("aiStatusBadge").innerText = "🔴 On Air";
+        document.getElementById("aiStatusBadge").className =
+          "badge bg-danger animate-pulse";
+        document.getElementById("chat-log").innerHTML = "";
+
+        const speechConfig =
+          SpeechSDK.SpeechTranslationConfig.fromAuthorizationToken(
+            authToken,
+            region
+          );
+
+        // 1. IMPROVED CONFIGURATION FOR TAMIL
+        speechConfig.setProfanity(SpeechSDK.ProfanityOption.Raw); // Prevent filtering medical terms
+
+        if (lang === "ta") {
+          speechConfig.speechRecognitionLanguage = "ta-IN";
+          speechConfig.addTargetLanguage("en");
+        } else {
+          speechConfig.speechRecognitionLanguage = "en-US";
+          speechConfig.addTargetLanguage("ta");
+        }
+
+        const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+        recognizer = new SpeechSDK.TranslationRecognizer(
+          speechConfig,
+          audioConfig
+        );
+
+        // Add Glossary for better accuracy
+        if (vocabList.length > 0) {
+          const ph = SpeechSDK.PhraseListGrammar.fromRecognizer(recognizer);
+          vocabList.forEach((entry) => {
+            ph.addPhrase(entry.english);
+            entry.tamil_synonyms.forEach((s) => ph.addPhrase(s));
+          });
+        }
+
+        recognizer.recognized = (s, e) => {
+          if (!isCallActive) return;
+
+          // 2. CHECK MUTE STATE (Ignore audio if muted)
+          if (isMuted) return;
+
+          if (e.result.reason === SpeechSDK.ResultReason.TranslatedSpeech) {
+            const original = e.result.text;
+            let translated =
+              lang === "ta"
+                ? e.result.translations.get("en")
+                : e.result.translations.get("ta");
+
+            if (!original) return;
+
+            translated = refineTranslation(original, translated, lang);
+            const risk = analyzeRisk(translated + " " + original);
+
+            addBubble(original, risk, "me");
+            socket.emit("send_translation", {
+              room: currentRoom,
+              original: original,
+              translation: translated,
+              risk: risk,
+              sourceLang: lang,
+            });
+          }
+        };
+
+        // Start listening
+        recognizer.startContinuousRecognitionAsync();
+      }
+
+      socket.on("receive_translation", (data) => {
+        if (!isCallActive) return;
+        let textToDisplay =
+          data.sourceLang === myLang ? data.original : data.translation;
+        let textToPlay =
+          data.sourceLang === myLang ? data.original : data.translation;
+        let voiceToUse =
+          myLang === "ta" ? "ta-IN-PallaviNeural" : "en-US-JennyNeural";
+
+        addBubble(textToDisplay, data.risk, "other");
+        speakText(textToPlay, voiceToUse);
+      });
+
+      function speakText(text, voiceName) {
+        if (!azureToken) {
+          console.error("❌ No Azure Token found. Cannot speak.");
+          return;
+        }
+
+        console.log(`🔊 Speaking (${voiceName}): ${text}`);
+
+        const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(
+          azureToken,
+          azureRegion
+        );
+        speechConfig.speechSynthesisVoiceName = voiceName;
+
+        // Create a player
+        player = new SpeechSDK.SpeakerAudioDestination();
+
+        // Handle "AudioContext is suspended" browser error
+        player.onAudioStart = function (sender, args) {
+          console.log("✅ Audio started playing");
+        };
+
+        const audioConfig = SpeechSDK.AudioConfig.fromSpeakerOutput(player);
+        let syn = new SpeechSDK.SpeechSynthesizer(speechConfig, audioConfig);
+
+        syn.speakTextAsync(
+          text,
+          (result) => {
+            if (
+              result.reason ===
+              SpeechSDK.ResultReason.SynthesizingAudioCompleted
+            ) {
+              console.log("✅ Speech Synthesis Finished.");
+            } else {
+              console.error(
+                "❌ Speech Synthesis Canceled: " + result.errorDetails
+              );
+            }
+            syn.close();
+          },
+          (error) => {
+            console.error("❌ TTS Error: ", error);
+            syn.close();
+          }
+        );
+      }
+
+      // --- AUDIO UNLOCKER ---
+      function unlockBrowserAudio() {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+
+        const ctx = new AudioContext();
+        const oscillator = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+
+        gainNode.gain.value = 0; // Silent
+        oscillator.connect(gainNode);
+        gainNode.connect(ctx.destination);
+
+        if (ctx.state === "suspended") {
+          ctx.resume();
+        }
+
+        oscillator.start(0);
+        setTimeout(() => oscillator.stop(), 100);
+        console.log("🔓 Browser Audio Unlocked");
+      }
+
+      function analyzeRisk(text) {
+        const t = text.toLowerCase();
+        if (
+          t.includes("heart attack") ||
+          t.includes("nenju vali") ||
+          t.includes("collapsed")
+        )
+          return "CRITICAL";
+        if (t.includes("pain") || t.includes("bleeding") || t.includes("sugar"))
+          return "HIGH";
+        return "NORMAL";
+      }
+
+      function addBubble(text, risk, side) {
+        const log = document.getElementById("chat-log");
+        let riskClass = "",
+          badge = "";
+        if (risk === "CRITICAL") {
+          riskClass = "risk-critical";
+          badge = '<span class="text-danger fw-bold ms-2">⚠️ CRITICAL</span>';
+        }
+        const alignClass = side === "me" ? "bubble-me" : "bubble-other";
+        const icon = side === "me" ? "👤 Me" : "🗣️ Partner";
+        const html = `<div class="chat-bubble ${alignClass} ${riskClass}"><div class="meta-row"><span>${icon}</span>${badge}</div><div class="translation-text">${text}</div></div>`;
+        log.insertAdjacentHTML("beforeend", html);
+        log.scrollTop = log.scrollHeight;
+      }
+    </script>
+  </body>
+</html>
