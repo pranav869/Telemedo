@@ -8,6 +8,7 @@ import numpy as np
 import math
 import re
 import csv
+import cv2
 from math import radians, sin, cos, sqrt, asin
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, make_response
 from flask_socketio import SocketIO, emit, join_room, leave_room, close_room
@@ -17,6 +18,9 @@ from fpdf import FPDF
 import tensorflow as tf
 from werkzeug.utils import secure_filename
 import io
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 ## --- UNVOICED MODEL SETUP & ENDPOINT (MOVED BELOW APP INIT) ---
 # Place this after Flask app is initialized
 
@@ -77,20 +81,26 @@ except Exception as e:
 
 # Load graph
 def load_unvoiced_graph():
-    graph = tf.Graph()
-    with graph.as_default():
-        graph_def = tf.compat.v1.GraphDef()
-        with tf.io.gfile.GFile(UNVOICED_MODEL_PATH, 'rb') as f:
-            graph_def.ParseFromString(f.read())
-            tf.import_graph_def(graph_def, name='')
-    return graph
+    try:
+        graph = tf.Graph()
+        with graph.as_default():
+            graph_def = tf.compat.v1.GraphDef()
+            with tf.io.gfile.GFile(UNVOICED_MODEL_PATH, 'rb') as f:
+                graph_def.ParseFromString(f.read())
+                tf.import_graph_def(graph_def, name='')
+        return graph
+    except Exception as e:
+        print(f"[Unvoiced] Model not found or failed to load — feature disabled: {e}")
+        return None
 
 UNVOICED_GRAPH = load_unvoiced_graph()
-UNVOICED_SESSION = tf.compat.v1.Session(graph=UNVOICED_GRAPH)
+UNVOICED_SESSION = tf.compat.v1.Session(graph=UNVOICED_GRAPH) if UNVOICED_GRAPH is not None else None
 UNVOICED_LOCK = threading.Lock()
 
 @app.route('/predict_unvoiced', methods=['POST'])
 def predict_unvoiced():
+    if UNVOICED_GRAPH is None or UNVOICED_SESSION is None:
+        return jsonify({'success': False, 'disabled': True}), 200
     if 'frame' not in request.files:
         return jsonify({'success': False, 'error': 'No frame uploaded'}), 400
     file = request.files['frame']
@@ -157,6 +167,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interva
 # --- GLOBAL STATE ---
 # Structure: { 'room_id': { 'doctor_sid': 'xyz', 'patients': ['abc'] } }
 active_rooms = {}
+# Dedup cache: maps event_key -> timestamp; prevents duplicate voice calls within 90s
+_voice_dedup_cache: dict = {}
 print("🧠 Loading Cancer Model...")
 
 def build_cancer_model():
@@ -1064,6 +1076,67 @@ def assets_file(filename):
     # Serve local sign videos (and any other assets placed in /assets).
     return send_from_directory(ASSETS_FOLDER, filename)
 
+@app.route('/tfjs_model/<path:filename>')
+def tfjs_model(filename):
+    resp = make_response(send_from_directory('tfjs_model', filename))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
+
+# --- MediaPipe HandLandmarker (used by /extract_landmarks) ---
+_hand_detector = None
+_HAND_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+
+def _get_hand_detector():
+    global _hand_detector
+    if _hand_detector is None:
+        if not os.path.exists(_HAND_MODEL_PATH):
+            return None
+        try:
+            base_options = mp_python.BaseOptions(model_asset_path=_HAND_MODEL_PATH)
+            options = mp_vision.HandLandmarkerOptions(
+                base_options=base_options,
+                num_hands=1,
+                running_mode=mp_vision.RunningMode.IMAGE,
+            )
+            _hand_detector = mp_vision.HandLandmarker.create_from_options(options)
+        except Exception as e:
+            print(f'[HandLandmarker] init failed: {e}')
+    return _hand_detector
+
+@app.route('/extract_landmarks', methods=['POST'])
+def extract_landmarks():
+    detector = _get_hand_detector()
+    if detector is None:
+        return jsonify({'found': False, 'error': 'model not loaded'})
+    try:
+        file = request.files.get('frame')
+        if not file:
+            return jsonify({'found': False, 'error': 'no frame'})
+        img_array = np.frombuffer(file.read(), np.uint8)
+        img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            return jsonify({'found': False, 'error': 'bad image'})
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        result = detector.detect(mp_image)
+        if not result.hand_landmarks:
+            return jsonify({'found': False})
+        lm = result.hand_landmarks[0]
+        # Apply same wrist-relative normalization used in generate_dataset.py
+        wx, wy, wz = lm[0].x, lm[0].y, lm[0].z
+        palm_size = math.sqrt((lm[9].x - wx)**2 + (lm[9].y - wy)**2)
+        if palm_size < 1e-5:
+            return jsonify({'found': False, 'error': 'degenerate hand'})
+        features = []
+        for p in lm:
+            features.append((p.x - wx) / palm_size)
+            features.append((p.y - wy) / palm_size)
+            features.append((p.z - wz) / palm_size)
+        return jsonify({'found': True, 'landmarks': features})
+    except Exception as e:
+        return jsonify({'found': False, 'error': str(e)})
+
 @app.route('/signs-map', methods=['GET'])
 def get_signs_map():
     """
@@ -1187,6 +1260,93 @@ def _try_send_twilio_alert(message: str, to_numbers: list = None):
 
     any_sent = any(r["sent"] for r in results)
     return {"sent": any_sent, "results": results}
+
+
+def _make_twilio_voice_calls(message: str, to_numbers: list = None, event_key: str = ""):
+    """
+    Calls each emergency contact via Twilio Voice API and plays an AI-generated
+    message using TwiML <Say>.  Features:
+      - Deduplication: same event_key won't trigger calls again within 90 s
+      - Per-number retry: each number is tried up to 2 times before giving up
+      - Parallel threads: non-blocking, does not crash if Twilio fails
+      - Structured logging: prints status per number
+    """
+    # --- Deduplication ---
+    now = time.time()
+    # Purge stale keys older than 90 s
+    for k in list(_voice_dedup_cache):
+        if now - _voice_dedup_cache[k] > 90:
+            del _voice_dedup_cache[k]
+    if event_key and event_key in _voice_dedup_cache:
+        print(f"[VOICE] Duplicate event suppressed — key={event_key!r}")
+        return {"called": False, "reason": "duplicate_suppressed"}
+    if event_key:
+        _voice_dedup_cache[event_key] = now
+
+    # --- Credential check ---
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        print("[VOICE] Twilio not configured — skipping calls")
+        return {"called": False, "reason": "Twilio not configured"}
+    if not to_numbers:
+        to_numbers = [TWILIO_TO_NUMBER] if TWILIO_TO_NUMBER else []
+    if not to_numbers:
+        print("[VOICE] No recipient numbers — skipping calls")
+        return {"called": False, "reason": "No recipient numbers"}
+
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    except Exception as e:
+        print(f"[VOICE] Twilio client init failed: {e}")
+        return {"called": False, "reason": f"Twilio client init failed: {e}"}
+
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<Response><Say voice="alice" language="en-IN">{message}</Say></Response>'
+    )
+
+    results = []
+    lock = threading.Lock()
+    RETRY_ATTEMPTS = 2
+    RETRY_DELAY_S  = 3
+
+    def _call_one(number):
+        last_error = None
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                call = client.calls.create(
+                    twiml=twiml,
+                    to=number,
+                    from_=TWILIO_FROM_NUMBER,
+                )
+                sid = getattr(call, "sid", None)
+                print(f"[VOICE] ✅ Called {number} (attempt {attempt}) — SID: {sid}")
+                with lock:
+                    results.append({"to": number, "called": True,
+                                    "sid": sid, "attempt": attempt})
+                return  # success — no retry needed
+            except Exception as e:
+                last_error = e
+                print(f"[VOICE] ❌ Attempt {attempt}/{RETRY_ATTEMPTS} FAILED for {number} — {e}")
+                if attempt < RETRY_ATTEMPTS:
+                    time.sleep(RETRY_DELAY_S)
+        # All attempts exhausted
+        print(f"[VOICE] 🚫 All {RETRY_ATTEMPTS} attempts failed for {number} — {last_error}")
+        with lock:
+            results.append({"to": number, "called": False,
+                            "error": str(last_error), "attempts": RETRY_ATTEMPTS})
+
+    threads = [threading.Thread(target=_call_one, args=(n,), daemon=True)
+               for n in to_numbers[:5]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    any_called = any(r["called"] for r in results)
+    print(f"[VOICE] Summary — called={any_called} results={results}")
+    return {"called": any_called, "results": results}
+
 
 @app.route('/predict_sign', methods=['POST'])
 def predict_sign():
@@ -1396,9 +1556,23 @@ def alert():
 
     contacts = _fetch_firebase_emergency_contacts(patient_id)
     print(f"[ALERT] condition={condition} patient_id={patient_id!r} location={location} contacts={contacts}")
+
     twilio_result = _try_send_twilio_alert(msg, contacts)
-    print(f"[ALERT] Twilio result: {twilio_result}")
+    print(f"[ALERT] Twilio SMS result: {twilio_result}")
+
+    voice_message = (
+        "This is an emergency alert. "
+        "The patient may be unconscious. "
+        "Please reach immediately."
+    )
+    # event_key buckets by patient + condition + minute → prevents duplicate calls
+    # within the same 90-second dedup window even if /alert fires multiple times
+    event_key = f"{patient_id}:{condition}:{int(time.time() // 90)}"
+    voice_result = _make_twilio_voice_calls(voice_message, contacts, event_key=event_key)
+    print(f"[ALERT] Twilio Voice result: {voice_result}")
+
     event["twilio"] = twilio_result
+    event["voice"]  = voice_result
     _append_emergency_log({"type": "emergency_alert_delivery", "event": event})
 
     # Emit nearest hospitals to doctor in real-time via Socket.IO
@@ -1477,12 +1651,17 @@ def _find_nearest_hospitals_fast(lat, lon, n=5):
     for _, row in nearest.iterrows():
         dist = round(float(row["_dist_km"]), 2)
         eta  = max(1, round((dist / 40) * 60))
+        h_lat = float(row[lc])
+        h_lon = float(row[lnc])
+        print(f"[Hospital] {str(row[nc])[:30]} → lat={h_lat}, lon={h_lon}, dist={dist}km")
         results.append({
             "name":    str(row[nc]),
             "address": str(row[ac])[:50],
             "dist":    dist,
             "time":    f"{eta} mins",
             "phone":   "108",
+            "lat":     h_lat,
+            "lon":     h_lon,
         })
     return results
 
@@ -1563,6 +1742,68 @@ def debug_emit():
     print(f"[DEBUG_EMIT] active_rooms={dict(active_rooms)}")
     return f"<pre>OK — {msg}\n\nactive_rooms={dict(active_rooms)}</pre>"
 
+@app.route('/test_voice')
+def test_voice():
+    """
+    Diagnostic route — call this in browser to test Twilio voice without
+    triggering a real emergency.
+    Usage: http://localhost:10000/test_voice?to=+91XXXXXXXXXX
+    """
+    to_number = request.args.get("to", "").strip()
+    lines = []
+
+    # 1. Check credentials
+    lines.append(f"TWILIO_ACCOUNT_SID  : {'✅ set' if TWILIO_ACCOUNT_SID  else '❌ MISSING'}")
+    lines.append(f"TWILIO_AUTH_TOKEN   : {'✅ set' if TWILIO_AUTH_TOKEN   else '❌ MISSING'}")
+    lines.append(f"TWILIO_FROM_NUMBER  : {TWILIO_FROM_NUMBER  or '❌ MISSING'}")
+    lines.append(f"TWILIO_TO_NUMBER    : {TWILIO_TO_NUMBER    or '❌ MISSING'}")
+    lines.append(f"EMERGENCY_CONTACTS  : {EMERGENCY_CONTACTS_ENV or '(empty — will use TWILIO_TO_NUMBER)'}")
+    lines.append("")
+
+    target = to_number or TWILIO_TO_NUMBER
+    if not target:
+        lines.append("❌ No target number. Pass ?to=+91XXXXXXXXXX or set TWILIO_TO_NUMBER in .env")
+        return f"<pre>{'chr(10)'.join(lines)}</pre>"
+
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        lines.append("❌ Twilio credentials missing — check .env")
+        return f"<pre>{chr(10).join(lines)}</pre>"
+
+    lines.append(f"Attempting voice call to: {target}")
+    try:
+        from twilio.rest import Client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        # Check account type (trial accounts can only call verified numbers)
+        account = client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
+        lines.append(f"Account status : {account.status}")
+        lines.append(f"Account type   : {getattr(account, 'type', 'unknown')}")
+        if "trial" in str(account.status).lower():
+            lines.append("⚠️  TRIAL ACCOUNT — can only call numbers verified at twilio.com/console/phone-numbers/verified")
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Say voice="alice" language="en-IN">'
+            'This is a test emergency alert from the Tele-Health platform.'
+            '</Say></Response>'
+        )
+        call = client.calls.create(
+            twiml=twiml,
+            to=target,
+            from_=TWILIO_FROM_NUMBER,
+        )
+        lines.append(f"✅ Call initiated — SID: {call.sid}  status: {call.status}")
+    except Exception as e:
+        lines.append(f"❌ Call FAILED: {e}")
+        lines.append("")
+        lines.append("Common causes:")
+        lines.append("  1. Trial account — 'to' number not verified at twilio.com/console/phone-numbers/verified")
+        lines.append("  2. TWILIO_FROM_NUMBER has no Voice capability (check Twilio console)")
+        lines.append("  3. Wrong number format — must be E.164 e.g. +919876543210")
+        lines.append("  4. TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN are incorrect")
+
+    return f"<pre>{chr(10).join(lines)}</pre>"
+
 # --- VIDEO & AGORA ROUTES (MERGED) ---
 
 @app.route('/get-token', methods=['GET'])
@@ -1579,6 +1820,28 @@ def get_token():
         return jsonify({"token": response.text, "region": AZURE_REGION})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/get-speech-config', methods=['GET'])
+def get_speech_config():
+    if not AZURE_SPEECH_KEY:
+        return jsonify({"error": "Missing AZURE_SPEECH_KEY in .env"}), 500
+    return jsonify({"key": AZURE_SPEECH_KEY, "region": AZURE_REGION})
+
+@app.route('/translate-free', methods=['GET'])
+def translate_free():
+    text = request.args.get('text', '').strip()
+    from_lang = request.args.get('from', 'en')
+    to_lang = request.args.get('to', 'ta')
+    if not text:
+        return jsonify({"translation": ""})
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(text)}&langpair={from_lang}|{to_lang}"
+        r = requests.get(url, timeout=6)
+        data = r.json()
+        translated = data.get("responseData", {}).get("translatedText", text)
+        return jsonify({"translation": translated})
+    except Exception as e:
+        return jsonify({"translation": text, "error": str(e)})
 
 @app.route('/get-glossary', methods=['GET'])
 def get_glossary():
@@ -1650,6 +1913,26 @@ def handle_join_request(data):
 def handle_translation(data):
     room = data['room']
     emit('receive_translation', data, room=room, include_self=False)
+
+@socketio.on('emotion_update')
+def handle_emotion_update(data):
+    room = data.get('room', '')
+    emit('emotion_update', data, room=room, include_self=False)
+
+@socketio.on('sign_translation')
+def handle_sign_translation(data):
+    room = data.get('room', '')
+    emit('sign_translation', data, room=room, include_self=False)
+
+@socketio.on('sign_detection_status')
+def handle_sign_detection_status(data):
+    room = data.get('room', '')
+    emit('sign_detection_status', data, room=room, include_self=False)
+
+@socketio.on('send_patient_sign_text')
+def handle_patient_sign_text(data):
+    room = data.get('room', '')
+    emit('receive_patient_sign_text', data, room=room, include_self=False)
 
 @socketio.on('send_sign_sentence')
 def handle_sign_sentence(data):
